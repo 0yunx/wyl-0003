@@ -23,6 +23,7 @@ const db = new DatabaseSync(DB_PATH);
 const migrations = [
   {
     version: 1,
+    description: '初始版本：sensor_data 基础表 + config 表',
     up: (db) => {
       db.exec(`
         CREATE TABLE IF NOT EXISTS sensor_data (
@@ -45,6 +46,7 @@ const migrations = [
   },
   {
     version: 2,
+    description: '新增告警相关字段 + alerts 告警事件表',
     up: (db) => {
       db.exec(`
         ALTER TABLE sensor_data ADD COLUMN alert INTEGER NOT NULL DEFAULT 0;
@@ -73,28 +75,48 @@ const migrations = [
   },
   {
     version: 3,
+    description: '新增 alerts 时间索引 + sensor_data 告警查询索引',
     up: (db) => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_alerts_started_at ON alerts(started_at);
+        CREATE INDEX IF NOT EXISTS idx_sensor_alert ON sensor_data(sensor_type, alert, timestamp);
+      `);
     }
   }
 ];
 
 const LATEST_SCHEMA_VERSION = migrations[migrations.length - 1].version;
+const HISTORY_DEFAULT_LIMIT = 1000;
+const HISTORY_MAX_LIMIT = 10000;
+const ALERTS_DEFAULT_LIMIT = 100;
+const ALERTS_MAX_LIMIT = 500;
 
 function getSchemaVersion() {
   try {
-    const stmt = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?");
-    const row = stmt.get('schema_version');
-    if (!row) {
-      const stmt2 = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?");
-      const hasSensorData = stmt2.get('sensor_data');
-      const hasAlerts = stmt2.get('alerts');
-      if (!hasSensorData) return 0;
-      if (hasAlerts) return 2;
+    const checkTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?");
+    const hasSchemaVersion = !!checkTable.get('schema_version');
+
+    if (hasSchemaVersion) {
+      const stmt = db.prepare('SELECT MAX(version) as v FROM schema_version');
+      const r = stmt.get();
+      if (r && r.v !== null && r.v !== undefined) {
+        return r.v;
+      }
+    }
+
+    const hasSensorData = !!checkTable.get('sensor_data');
+    if (!hasSensorData) return 0;
+
+    const hasAlerts = !!checkTable.get('alerts');
+    if (!hasAlerts) return 1;
+
+    try {
+      const checkCol = db.prepare('SELECT alert FROM sensor_data LIMIT 1');
+      checkCol.get();
+      return 2;
+    } catch (e) {
       return 1;
     }
-    const stmt3 = db.prepare('SELECT MAX(version) as v FROM schema_version');
-    const r = stmt3.get();
-    return r ? r.v || 0 : 0;
   } catch (e) {
     return 0;
   }
@@ -118,7 +140,7 @@ function runMigrations() {
 
   for (const migration of migrations) {
     if (migration.version > currentVersion) {
-      console.log(`[DB] 正在迁移到 v${migration.version}...`);
+      console.log(`[DB] 正在迁移到 v${migration.version}: ${migration.description}`);
       try {
         migration.up(db);
         const stmt = db.prepare('INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)');
@@ -372,6 +394,10 @@ app.get('/api/history', (req, res) => {
   try {
     const { sensor, from, to, limit } = req.query;
 
+    let parsedLimit = limit ? parseInt(limit) : HISTORY_DEFAULT_LIMIT;
+    if (isNaN(parsedLimit) || parsedLimit < 1) parsedLimit = HISTORY_DEFAULT_LIMIT;
+    if (parsedLimit > HISTORY_MAX_LIMIT) parsedLimit = HISTORY_MAX_LIMIT;
+
     let sql = 'SELECT sensor_type, value, unit, alert, alert_direction, threshold_min, threshold_max, timestamp FROM sensor_data WHERE 1=1';
     const params = [];
 
@@ -388,12 +414,8 @@ app.get('/api/history', (req, res) => {
       params.push(parseInt(to));
     }
 
-    sql += ' ORDER BY timestamp ASC';
-
-    if (limit) {
-      sql += ' LIMIT ?';
-      params.push(parseInt(limit));
-    }
+    sql += ' ORDER BY timestamp ASC LIMIT ?';
+    params.push(parsedLimit);
 
     const stmt = db.prepare(sql);
     const rows = stmt.all(...params).map(r => ({
@@ -405,6 +427,8 @@ app.get('/api/history', (req, res) => {
       success: true,
       data: {
         count: rows.length,
+        limit: parsedLimit,
+        maxLimit: HISTORY_MAX_LIMIT,
         items: rows
       }
     });
@@ -417,6 +441,10 @@ app.get('/api/history', (req, res) => {
 app.get('/api/alerts', (req, res) => {
   try {
     const { sensor, status, from, to, limit } = req.query;
+
+    let parsedLimit = limit ? parseInt(limit) : ALERTS_DEFAULT_LIMIT;
+    if (isNaN(parsedLimit) || parsedLimit < 1) parsedLimit = ALERTS_DEFAULT_LIMIT;
+    if (parsedLimit > ALERTS_MAX_LIMIT) parsedLimit = ALERTS_MAX_LIMIT;
 
     let sql = 'SELECT * FROM alerts WHERE 1=1';
     const params = [];
@@ -438,12 +466,8 @@ app.get('/api/alerts', (req, res) => {
       params.push(parseInt(to));
     }
 
-    sql += ' ORDER BY started_at DESC';
-
-    if (limit) {
-      sql += ' LIMIT ?';
-      params.push(parseInt(limit));
-    }
+    sql += ' ORDER BY started_at DESC LIMIT ?';
+    params.push(parsedLimit);
 
     const stmt = db.prepare(sql);
     const rows = stmt.all(...params);
@@ -452,6 +476,8 @@ app.get('/api/alerts', (req, res) => {
       success: true,
       data: {
         count: rows.length,
+        limit: parsedLimit,
+        maxLimit: ALERTS_MAX_LIMIT,
         items: rows
       }
     });

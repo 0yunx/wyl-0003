@@ -181,6 +181,18 @@ GET /api/history?sensor=temperature&from=1719000000000&to=1719003600000
 - `MQTT_PORT` - MQTT Broker 端口，默认 1883
 - `MQTT_BROKER` - 模拟器连接的 MQTT Broker 地址，默认 mqtt://localhost:1883
 
+## Schema 版本迁移
+
+项目内置 migration 机制，数据库 schema 版本自动升级，换机器或升级版本无需手动处理。
+
+| 版本 | 变更内容 |
+|------|----------|
+| v1 | 初始版本：sensor_data 表、config 表 |
+| v2 | 新增 alert 相关字段 + alerts 告警事件表 |
+| v3 | schema_version 版本记录表 |
+
+启动时自动检测当前版本并执行未应用的迁移，迁移记录保存在 `schema_version` 表中。
+
 ## 技术栈
 
 - **后端**：Node.js + Express
