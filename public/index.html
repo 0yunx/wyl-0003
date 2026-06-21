@@ -294,6 +294,143 @@
     border-color: #ff4444;
     color: #ff6666;
   }
+
+  .panel-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+    gap: 20px;
+    max-width: 800px;
+    margin: 20px auto;
+  }
+
+  .export-panel, .offline-panel {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    padding: 18px;
+    backdrop-filter: blur(10px);
+  }
+  .export-panel h2, .offline-panel h2 {
+    text-align: center;
+    margin-bottom: 15px;
+    font-size: 18px;
+    color: #00d4ff;
+  }
+  .export-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .export-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .export-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .export-field label {
+    font-size: 12px;
+    color: #aaa;
+  }
+  .export-field input, .export-field select {
+    padding: 7px 10px;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    color: #fff;
+    font-size: 13px;
+  }
+  .export-field input:focus, .export-field select:focus {
+    outline: none;
+    border-color: #00d4ff;
+  }
+  .export-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 6px;
+  }
+  .export-actions .btn {
+    flex: 1;
+    padding: 9px 18px;
+    font-size: 13px;
+  }
+  .btn-secondary {
+    background: linear-gradient(90deg, #555, #333);
+  }
+  .btn-secondary:hover {
+    box-shadow: 0 4px 15px rgba(255, 255, 255, 0.15);
+  }
+  .export-progress {
+    font-size: 12px;
+    color: #888;
+    text-align: center;
+    margin-top: 4px;
+    min-height: 16px;
+  }
+
+  .offline-stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .offline-stat {
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 8px;
+    padding: 12px;
+    text-align: center;
+  }
+  .offline-stat-label {
+    font-size: 11px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .offline-stat-value {
+    font-size: 22px;
+    font-weight: 700;
+    font-family: 'Courier New', monospace;
+  }
+  .offline-stat-value.warn {
+    color: #ffaa00;
+    animation: pulse 1.5s infinite;
+  }
+  .offline-stat-value.good {
+    color: #00ff88;
+  }
+  .offline-stat-value.muted {
+    color: #666;
+  }
+  .broker-status {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 8px;
+    border-radius: 6px;
+    margin-top: 12px;
+    font-size: 13px;
+  }
+  .broker-status.up {
+    background: rgba(0, 255, 136, 0.1);
+    color: #00ff88;
+    border: 1px solid rgba(0, 255, 136, 0.3);
+  }
+  .broker-status.down {
+    background: rgba(255, 68, 68, 0.1);
+    color: #ff4444;
+    border: 1px solid rgba(255, 68, 68, 0.3);
+    animation: pulse 1.5s infinite;
+  }
+  .broker-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+  }
 </style>
 </head>
 <body>
@@ -419,6 +556,75 @@
     </div>
     <div class="config-actions">
       <button class="btn" onclick="saveConfig()">保存配置</button>
+    </div>
+  </div>
+
+  <div class="panel-grid">
+    <div class="export-panel">
+      <h2>📦 数据导出</h2>
+      <div class="export-form">
+        <div class="export-row">
+          <div class="export-field">
+            <label>开始时间</label>
+            <input type="datetime-local" id="exportFrom">
+          </div>
+          <div class="export-field">
+            <label>结束时间</label>
+            <input type="datetime-local" id="exportTo">
+          </div>
+        </div>
+        <div class="export-row">
+          <div class="export-field">
+            <label>导出格式</label>
+            <select id="exportFormat">
+              <option value="csv" selected>CSV (Excel 兼容)</option>
+              <option value="json">JSON</option>
+            </select>
+          </div>
+          <div class="export-field">
+            <label>压缩</label>
+            <select id="exportCompress">
+              <option value="none" selected>不压缩</option>
+              <option value="gzip">GZIP 压缩</option>
+            </select>
+          </div>
+        </div>
+        <div class="export-field">
+          <label>传感器类型（可选，留空=全部）</label>
+          <select id="exportSensor">
+            <option value="">全部传感器</option>
+            <option value="temperature">温度</option>
+            <option value="humidity">湿度</option>
+            <option value="light">光照</option>
+            <option value="soil">土壤湿度</option>
+            <option value="co2">CO₂</option>
+          </select>
+        </div>
+        <div class="export-actions">
+          <button class="btn btn-secondary" onclick="setQuickRange(1)">近 1 小时</button>
+          <button class="btn btn-secondary" onclick="setQuickRange(24)">近 24 小时</button>
+          <button class="btn" onclick="startExport()">🚀 导出</button>
+        </div>
+        <div class="export-progress" id="exportProgress"></div>
+      </div>
+    </div>
+
+    <div class="offline-panel">
+      <h2>🔁 离线补传队列</h2>
+      <div class="offline-stats">
+        <div class="offline-stat">
+          <div class="offline-stat-label">待补传条数</div>
+          <div class="offline-stat-value muted" id="offlinePending">0</div>
+        </div>
+        <div class="offline-stat">
+          <div class="offline-stat-label">最近补传时间</div>
+          <div class="offline-stat-value muted" id="offlineLastSuccess">--</div>
+        </div>
+      </div>
+      <div class="broker-status up" id="brokerStatus">
+        <span class="broker-dot"></span>
+        <span id="brokerStatusText">Broker 正常</span>
+      </div>
     </div>
   </div>
 
@@ -870,12 +1076,137 @@ async function saveConfig() {
   }
 }
 
+function toLocalInput(ts) {
+  const d = new Date(ts);
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+    'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+function fromLocalInput(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return d.getTime();
+}
+
+function setQuickRange(hours) {
+  const now = Date.now();
+  const from = now - hours * 60 * 60 * 1000;
+  document.getElementById('exportFrom').value = toLocalInput(from);
+  document.getElementById('exportTo').value = toLocalInput(now);
+  showToast(`已设置近 ${hours} 小时范围`);
+}
+
+async function startExport() {
+  const fromV = document.getElementById('exportFrom').value;
+  const toV = document.getElementById('exportTo').value;
+  const format = document.getElementById('exportFormat').value;
+  const compress = document.getElementById('exportCompress').value;
+  const sensor = document.getElementById('exportSensor').value;
+
+  const fromTs = fromLocalInput(fromV);
+  const toTs = fromLocalInput(toV);
+
+  if (!fromV || !toV) {
+    showToast('请先设置开始和结束时间', 'error');
+    return;
+  }
+  if (fromTs >= toTs) {
+    showToast('开始时间必须早于结束时间', 'error');
+    return;
+  }
+
+  const params = new URLSearchParams();
+  params.set('from', String(fromTs));
+  params.set('to', String(toTs));
+  params.set('format', format);
+  params.set('compress', compress);
+  if (sensor) params.set('sensor', sensor);
+
+  const url = '/api/export?' + params.toString();
+  const progressEl = document.getElementById('exportProgress');
+
+  progressEl.textContent = '⏳ 正在生成数据，请稍候...';
+  showToast('导出任务已开始，大文件可能需要数十秒');
+
+  try {
+    const headRes = await fetch(url, { method: 'HEAD' });
+    const total = headRes.headers.get('X-Total-Count');
+    if (total !== null) {
+      progressEl.textContent = `📊 预计 ${parseInt(total).toLocaleString()} 行，下载中...`;
+    }
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.style.display = 'none';
+    a.addEventListener('click', () => {
+      setTimeout(() => {
+        setTimeout(() => {
+          progressEl.textContent = '✅ 下载已启动，请查看浏览器下载栏';
+        }, 2000);
+      }, 500);
+    });
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  } catch (err) {
+    progressEl.textContent = '❌ 导出失败: ' + err.message;
+    showToast('导出失败', 'error');
+  }
+}
+
+async function fetchHealth() {
+  try {
+    const res = await fetch('/api/health');
+    const data = await res.json();
+    if (!data.success) return;
+    const h = data.data;
+
+    const pendingEl = document.getElementById('offlinePending');
+    const lastEl = document.getElementById('offlineLastSuccess');
+    const brokerEl = document.getElementById('brokerStatus');
+    const brokerTextEl = document.getElementById('brokerStatusText');
+
+    const pending = h.queue.pending || 0;
+    pendingEl.textContent = pending.toLocaleString();
+    pendingEl.className = 'offline-stat-value ' +
+      (pending > 0 ? 'warn' : 'good');
+
+    if (h.queue.lastSuccess) {
+      lastEl.textContent = formatDateTime(h.queue.lastSuccess);
+      lastEl.className = 'offline-stat-value good';
+    } else {
+      lastEl.textContent = '暂无';
+      lastEl.className = 'offline-stat-value muted';
+    }
+
+    if (h.broker.connected) {
+      brokerEl.className = 'broker-status up';
+      brokerTextEl.textContent = `Broker 正常 · ${h.broker.connectedClients} 台设备`;
+    } else {
+      brokerEl.className = 'broker-status down';
+      brokerTextEl.textContent = 'Broker 异常 · 无设备连接';
+    }
+  } catch (e) {
+    // 静默忽略，轮询继续
+  }
+}
+
+(function initExportDefaults() {
+  const now = Date.now();
+  const from = now - 60 * 60 * 1000;
+  document.getElementById('exportFrom').value = toLocalInput(from);
+  document.getElementById('exportTo').value = toLocalInput(now);
+})();
+
 async function init() {
   await loadConfig();
   await loadHistory();
   await loadAlertEvents();
   fetchLatest();
+  fetchHealth();
   setInterval(fetchLatest, 2000);
+  setInterval(fetchHealth, 3000);
 }
 
 init();

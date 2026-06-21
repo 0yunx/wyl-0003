@@ -5,6 +5,8 @@ const Aedes = require('aedes');
 const net = require('net');
 const mqtt = require('mqtt');
 const { DatabaseSync } = require('node:sqlite');
+const createExportRouter = require('./export');
+const createOfflineQueue = require('./offline_queue');
 
 const PORT = process.env.PORT || 3000;
 const MQTT_PORT = process.env.MQTT_PORT || 1883;
@@ -80,6 +82,27 @@ const migrations = [
       db.exec(`
         CREATE INDEX IF NOT EXISTS idx_alerts_started_at ON alerts(started_at);
         CREATE INDEX IF NOT EXISTS idx_sensor_alert ON sensor_data(sensor_type, alert, timestamp);
+      `);
+    }
+  },
+  {
+    version: 4,
+    description: '新增离线补传队列表 offline_queue + 时间戳去重索引',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS offline_queue (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          device_id TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          timestamp INTEGER NOT NULL,
+          fingerprint TEXT NOT NULL,
+          retry_count INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'pending',
+          created_at INTEGER NOT NULL,
+          last_attempt_at INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_offline_fingerprint ON offline_queue(fingerprint);
+        CREATE INDEX IF NOT EXISTS idx_offline_status_time ON offline_queue(status, created_at);
       `);
     }
   }
@@ -315,32 +338,10 @@ mqttClient.on('message', (topic, message) => {
     }
 
     if (topic === 'greenhouse/sensors') {
+      const result = offlineQueue.ingest(data);
+      if (result.dedup) return;
       const deviceId = data.deviceId || 'unknown';
-      const timestamp = data.timestamp || Date.now();
-      lastSeen[deviceId] = timestamp;
       deviceOnline = true;
-
-      for (const [sensorType, reading] of Object.entries(data.readings)) {
-        const alertInfo = checkThreshold(sensorType, reading.value);
-        const th = alertInfo.threshold;
-
-        insertSensorStmt.run(
-          deviceId, sensorType, reading.value, reading.unit,
-          alertInfo.alert ? 1 : 0, alertInfo.direction,
-          th ? th.min : null, th ? th.max : null, timestamp
-        );
-
-        processAlertTransition(deviceId, sensorType, reading.value, alertInfo, timestamp);
-
-        latestData[sensorType] = {
-          value: reading.value,
-          unit: reading.unit,
-          name: reading.name,
-          timestamp,
-          alert: alertInfo.alert,
-          alertDirection: alertInfo.direction
-        };
-      }
     }
   } catch (err) {
     console.error('[MQTT] 消息处理错误:', err.message);
@@ -368,6 +369,13 @@ function sendSuccess(res, data, statusCode) {
     data
   });
 }
+
+const helpers = { sendError, sendSuccess };
+const offlineQueue = createOfflineQueue({ db, helpers, aedes });
+offlineQueue.setSharedRefs({ activeAlerts, thresholds, latestData, lastSeen, processAlertTransition, checkThreshold });
+offlineQueue.start();
+app.use(createExportRouter(db, helpers));
+app.use(offlineQueue.router);
 
 app.get('/api/latest', (req, res) => {
   try {

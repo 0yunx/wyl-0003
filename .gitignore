@@ -5,3 +5,4 @@ db.sqlite
 .env
 .env.local
 .env.*.local
+.simulator_queue.json
