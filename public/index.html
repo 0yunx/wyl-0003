@@ -127,11 +127,11 @@
     height: 180px;
   }
 
-  .config-panel {
+  .config-panel, .alerts-panel {
     max-width: 800px;
     margin: 20px auto;
   }
-  .config-panel h2 {
+  .config-panel h2, .alerts-panel h2 {
     text-align: center;
     margin-bottom: 15px;
     font-size: 20px;
@@ -191,6 +191,67 @@
   }
   .btn:active { transform: translateY(0); }
 
+  .alerts-list {
+    max-height: 240px;
+    overflow-y: auto;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 8px;
+  }
+  .alert-item {
+    padding: 10px 15px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 13px;
+  }
+  .alert-item:last-child { border-bottom: none; }
+  .alert-item.active {
+    background: rgba(255, 68, 68, 0.15);
+    border-left: 3px solid #ff4444;
+  }
+  .alert-item.resolved {
+    border-left: 3px solid #00ff88;
+  }
+  .alert-item.offline {
+    border-left: 3px solid #ffaa00;
+  }
+  .alert-sensor {
+    font-weight: 600;
+  }
+  .alert-direction {
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    margin-left: 8px;
+  }
+  .alert-direction.high {
+    background: rgba(255, 68, 68, 0.3);
+    color: #ff6666;
+  }
+  .alert-direction.low {
+    background: rgba(68, 170, 255, 0.3);
+    color: #66aaff;
+  }
+  .alert-time {
+    color: #888;
+    font-size: 12px;
+  }
+  .alert-value {
+    font-family: 'Courier New', monospace;
+    color: #ff6666;
+  }
+  .alert-duration {
+    color: #888;
+    font-size: 12px;
+  }
+  .no-alerts {
+    text-align: center;
+    padding: 30px;
+    color: #666;
+    font-size: 14px;
+  }
+
   .sensor-temp { color: #ff6b6b; }
   .sensor-humidity { color: #4ecdc4; }
   .sensor-light { color: #ffe66d; }
@@ -208,6 +269,9 @@
       </div>
       <div class="status-badge" style="background: rgba(0,212,255,0.1); border: 1px solid #00d4ff; color: #00d4ff;">
         <span>刷新间隔: 2s</span>
+      </div>
+      <div id="alertCount" class="status-badge" style="background: rgba(255,68,68,0.1); border: 1px solid #ff4444; color: #ff4444; display: none;">
+        <span>活跃告警: 0</span>
       </div>
     </div>
   </div>
@@ -265,6 +329,13 @@
       <div class="chart-container">
         <canvas id="co2Chart"></canvas>
       </div>
+    </div>
+  </div>
+
+  <div class="card alerts-panel">
+    <h2>🚨 告警事件记录</h2>
+    <div id="alertsList" class="alerts-list">
+      <div class="no-alerts">暂无告警记录</div>
     </div>
   </div>
 
@@ -407,6 +478,20 @@ function formatTime(ts) {
   return d.toLocaleTimeString('zh-CN', { hour12: false });
 }
 
+function formatDateTime(ts) {
+  const d = new Date(ts);
+  return d.toLocaleString('zh-CN', { hour12: false });
+}
+
+function formatDuration(ms) {
+  if (!ms) return '-';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + '秒';
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  return m + '分' + rs + '秒';
+}
+
 async function fetchLatest() {
   try {
     const res = await fetch('/api/latest');
@@ -419,6 +504,15 @@ async function fetchLatest() {
     } else {
       statusEl.className = 'status-badge status-offline';
       statusEl.querySelector('span:last-child').textContent = '设备离线';
+    }
+
+    const alertCountEl = document.getElementById('alertCount');
+    const activeAlertCount = data.activeAlerts || 0;
+    if (activeAlertCount > 0) {
+      alertCountEl.style.display = 'flex';
+      alertCountEl.querySelector('span').textContent = '活跃告警: ' + activeAlertCount;
+    } else {
+      alertCountEl.style.display = 'none';
     }
 
     if (data.thresholds) {
@@ -465,6 +559,8 @@ async function fetchLatest() {
     } else {
       alertBanner.classList.remove('active');
     }
+
+    loadAlertEvents();
   } catch (err) {
     console.error('获取数据失败:', err);
   }
@@ -512,10 +608,7 @@ async function loadHistory() {
       const dp = dataPoints[sensor];
       dp.labels = items.map(i => formatTime(i.timestamp));
       dp.values = items.map(i => i.value);
-      dp.alerts = items.map(i => {
-        const th = thresholds[sensor];
-        return th ? (i.value < th.min || i.value > th.max) : false;
-      });
+      dp.alerts = items.map(i => i.alert);
 
       if (dp.labels.length > maxPoints) {
         const start = dp.labels.length - maxPoints;
@@ -528,6 +621,46 @@ async function loadHistory() {
     }
   } catch (err) {
     console.error('加载历史数据失败:', err);
+  }
+}
+
+async function loadAlertEvents() {
+  try {
+    const res = await fetch('/api/alerts?limit=20');
+    const data = await res.json();
+
+    const listEl = document.getElementById('alertsList');
+    if (data.count === 0) {
+      listEl.innerHTML = '<div class="no-alerts">暂无告警记录</div>';
+      return;
+    }
+
+    let html = '';
+    for (const alert of data.data) {
+      const sensorName = labelsMap[alert.sensor_type] || alert.sensor_type;
+      const directionText = alert.direction === 'high' ? '过高' : '过低';
+      const statusClass = alert.status === 'active' ? 'active' :
+                          alert.status === 'resolved' ? 'resolved' : 'offline';
+      const statusText = alert.status === 'active' ? '进行中' :
+                         alert.status === 'resolved' ? '已恢复' : '设备离线';
+
+      html += `
+        <div class="alert-item ${statusClass}">
+          <div>
+            <span class="alert-sensor">${sensorName}</span>
+            <span class="alert-direction ${alert.direction}">${directionText}</span>
+            <span class="alert-value">${alert.value} ${unitMap[alert.sensor_type] || ''}</span>
+          </div>
+          <div style="text-align: right;">
+            <div class="alert-time">${formatDateTime(alert.started_at)}</div>
+            <div class="alert-duration">${statusText} · ${formatDuration(alert.duration)}</div>
+          </div>
+        </div>
+      `;
+    }
+    listEl.innerHTML = html;
+  } catch (err) {
+    console.error('加载告警事件失败:', err);
   }
 }
 
@@ -597,6 +730,7 @@ async function saveConfig() {
 async function init() {
   await loadConfig();
   await loadHistory();
+  await loadAlertEvents();
   fetchLatest();
   setInterval(fetchLatest, 2000);
 }
