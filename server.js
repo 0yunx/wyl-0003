@@ -105,6 +105,19 @@ const migrations = [
         CREATE INDEX IF NOT EXISTS idx_offline_status_time ON offline_queue(status, created_at);
       `);
     }
+  },
+  {
+    version: 5,
+    description: 'sensor_data 添加 (device_id, timestamp, sensor_type) 唯一索引防补传重复写入',
+    up: (db) => {
+      db.exec(`
+        DELETE FROM sensor_data WHERE rowid NOT IN (
+          SELECT MAX(rowid) FROM sensor_data GROUP BY device_id, timestamp, sensor_type
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sensor_dedup
+          ON sensor_data(device_id, timestamp, sensor_type);
+      `);
+    }
   }
 ];
 
@@ -217,7 +230,7 @@ let resolveAlertStmt;
 
 function prepareStatements() {
   insertSensorStmt = db.prepare(
-    'INSERT INTO sensor_data (device_id, sensor_type, value, unit, alert, alert_direction, threshold_min, threshold_max, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    'INSERT OR IGNORE INTO sensor_data (device_id, sensor_type, value, unit, alert, alert_direction, threshold_min, threshold_max, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
   );
   insertAlertStmt = db.prepare(
     'INSERT INTO alerts (device_id, sensor_type, direction, value, threshold_min, threshold_max, started_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
@@ -238,9 +251,10 @@ function isDeviceOnline(deviceId) {
 function checkThreshold(sensorType, value) {
   const th = thresholds[sensorType];
   if (!th) return { alert: false, direction: null, threshold: null };
-  const alert = value < th.min || value > th.max;
-  const direction = value < th.min ? 'low' : (value > th.max ? 'high' : null);
-  return { alert, direction, threshold: th };
+  const threshold = { min: th.min, max: th.max };
+  const alert = value < threshold.min || value > threshold.max;
+  const direction = value < threshold.min ? 'low' : (value > threshold.max ? 'high' : null);
+  return { alert, direction, threshold };
 }
 
 function processAlertTransition(deviceId, sensorType, value, alertInfo, timestamp) {
@@ -371,7 +385,7 @@ function sendSuccess(res, data, statusCode) {
 }
 
 const helpers = { sendError, sendSuccess };
-const offlineQueue = createOfflineQueue({ db, helpers, aedes });
+const offlineQueue = createOfflineQueue({ db, helpers, aedes, schemaVersion: LATEST_SCHEMA_VERSION });
 offlineQueue.setSharedRefs({ activeAlerts, thresholds, latestData, lastSeen, processAlertTransition, checkThreshold });
 offlineQueue.start();
 app.use(createExportRouter(db, helpers));

@@ -13,7 +13,7 @@ function makeFingerprint(deviceId, timestamp) {
     .digest('hex');
 }
 
-module.exports = function createOfflineQueue({ db, helpers, aedes }) {
+module.exports = function createOfflineQueue({ db, helpers, aedes, schemaVersion }) {
   const state = {
     brokerConnected: false,
     lastSuccessTs: 0,
@@ -72,7 +72,7 @@ module.exports = function createOfflineQueue({ db, helpers, aedes }) {
     `);
 
     state.insertSensorStmt = db.prepare(
-      'INSERT INTO sensor_data (device_id, sensor_type, value, unit, alert, alert_direction, threshold_min, threshold_max, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO sensor_data (device_id, sensor_type, value, unit, alert, alert_direction, threshold_min, threshold_max, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
     );
 
     state.insertAlertStmt = db.prepare(
@@ -281,7 +281,7 @@ module.exports = function createOfflineQueue({ db, helpers, aedes }) {
             lastSuccess: snap.lastRetransmitTs,
             lastFailed: snap.lastFailedTs
           },
-          schemaVersion: 4,
+          schemaVersion: schemaVersion || 0,
           timestamp: Date.now()
         }
       });
