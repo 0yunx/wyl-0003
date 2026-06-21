@@ -1,0 +1,19 @@
+{
+  "name": "smart-greenhouse-iot-gateway",
+  "version": "1.0.0",
+  "description": "智能温室 IoT 边缘网关模拟器",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "simulator": "node simulator.js",
+    "dev": "concurrently \"npm start\" \"npm run simulator\""
+  },
+  "dependencies": {
+    "aedes": "^0.51.0",
+    "express": "^4.19.2",
+    "mqtt": "^5.10.1"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
