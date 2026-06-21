@@ -24,10 +24,12 @@
 
 ```
 wyl-0003/
-├── server.js          # Express 服务 + MQTT Broker + SQLite 存储
-├── simulator.js       # 5 路传感器 MQTT 模拟器
+├── server.js          # Express 服务 + MQTT Broker + SQLite 存储 + migration
+├── simulator.js       # 5 路传感器 MQTT 模拟器（含信号注入 + 本地补传队列）
+├── export.js          # 流式数据导出路由（/api/export）
+├── offline_queue.js   # 离线补传队列管理（/api/health + 定时 flush）
 ├── public/
-│   └── index.html     # Chart.js 实时监控前端
+│   └── index.html     # Chart.js 实时监控前端（含导出面板 + 离线队列面板）
 ├── db.sqlite          # SQLite 数据库（自动生成）
 ├── package.json
 └── README.md
@@ -159,6 +161,31 @@ GET /api/history?sensor=temperature&from=1719000000000&to=1719003600000
   }
 }
 ```
+
+## 离线补传架构
+
+```
+模拟器 (simulator.js)                 服务端 (server.js + offline_queue.js)
+┌─────────────────────┐              ┌──────────────────────────────────────┐
+│  定时推送 sensor 数据  │── MQTT ───▶│  ingest()                            │
+│                     │              │  ├─ 计算 fingerprint (SHA1)           │
+│  信号注入机制：       │              │  ├─ INSERT OR IGNORE → offline_queue  │
+│  ├─ socket hangup   │              │  ├─ INSERT OR IGNORE → sensor_data   │
+│  └─ 进程卡死 5-8s   │              │  └─ markDone / markAttempt            │
+│                     │              │                                      │
+│  断连时：            │              │  定时 flush (3s)：                    │
+│  ├─ 数据入本地队列    │              │  ├─ 拉取 pending 行                  │
+│  ├─ 落盘 .json 文件  │              │  ├─ 重试写入 sensor_data             │
+│  └─ 重连后批量补发    │── MQTT ───▶│  └─ 成功则 markDone                   │
+│                     │              │                                      │
+└─────────────────────┘              │  /api/health 暴露：                   │
+                                     │  ├─ broker 连接状态                   │
+                                     │  ├─ 补传队列 pending 深度              │
+                                     │  └─ 最近补传时间戳                     │
+                                     └──────────────────────────────────────┘
+```
+
+**去重保证**：`sensor_data` 表有 `UNIQUE(device_id, timestamp, sensor_type)` 索引，`INSERT OR IGNORE` 保证同一帧数据不会重复写入；`offline_queue` 表有 `UNIQUE(fingerprint)` 索引，fingerprint 由 `SHA1(deviceId|timestamp)` 生成，保证同一帧不会重复入队。
 
 ## 验证步骤
 

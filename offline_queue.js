@@ -110,7 +110,7 @@ module.exports = function createOfflineQueue({ db, helpers, aedes, schemaVersion
     }
   }
 
-  function processPayloadInternal(data) {
+  function processPayloadInternal(data, { realtime = true } = {}) {
     const deviceId = data.deviceId || 'unknown';
     const timestamp = data.timestamp || Date.now();
     const readings = data.readings || {};
@@ -125,17 +125,21 @@ module.exports = function createOfflineQueue({ db, helpers, aedes, schemaVersion
           alertInfo.alert ? 1 : 0, alertInfo.direction,
           th ? th.min : null, th ? th.max : null, timestamp
         );
-        state.processAlertTransition(deviceId, sensorType, reading.value, alertInfo, timestamp);
-        state.latestData[sensorType] = {
-          value: reading.value,
-          unit: reading.unit,
-          name: reading.name,
-          timestamp,
-          alert: alertInfo.alert,
-          alertDirection: alertInfo.direction
-        };
+        if (realtime) {
+          state.processAlertTransition(deviceId, sensorType, reading.value, alertInfo, timestamp);
+          state.latestData[sensorType] = {
+            value: reading.value,
+            unit: reading.unit,
+            name: reading.name,
+            timestamp,
+            alert: alertInfo.alert,
+            alertDirection: alertInfo.direction
+          };
+        }
       }
-      state.lastSeen[deviceId] = timestamp;
+      if (realtime) {
+        state.lastSeen[deviceId] = timestamp;
+      }
       db.exec('COMMIT');
       return true;
     } catch (e) {
@@ -194,7 +198,7 @@ module.exports = function createOfflineQueue({ db, helpers, aedes, schemaVersion
         const now = Date.now();
         try {
           const data = JSON.parse(row.payload);
-          const ok = processPayloadInternal(data);
+          const ok = processPayloadInternal(data, { realtime: false });
           if (ok) {
             state.markDoneStmt.run(now, row.fingerprint);
             state.lastSuccessTs = now;
