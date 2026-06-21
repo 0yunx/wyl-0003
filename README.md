@@ -7,11 +7,14 @@
 - **5 路传感器模拟**：温度、湿度、光照、土壤湿度、CO₂
 - **MQTT 协议**：内置 Aedes MQTT Broker，每 2 秒推送 JSON 数据
 - **数据持久化**：SQLite 存储历史数据 + 告警事件，断电重启不丢失
-- **REST API**：提供最新数据、历史数据、告警事件、阈值配置接口
+- **Schema 版本管理**：内置 migration 机制，换机器/升版本自动升级数据库结构
+- **REST API**：统一响应格式（`{ success, data }` / `{ success, error }`），无堆栈泄露
 - **实时监控**：Chart.js 折线图，2 秒刷新
 - **阈值告警**：后端落库告警事件，前端曲线变红、数值闪烁、告警横幅、事件列表
-- **离线检测**：设备 10 秒无数据判定为离线
+- **告警状态机**：触发/恢复/设备离线/超时离线/服务关闭，5 种状态完整流转
+- **离线检测双重保障**：MQTT 遗嘱消息 + 后端定时轮询（10 秒超时判离线）
 - **热更新配置**：阈值可通过 API 动态调整
+- **前端性能优化**：告警列表增量 DOM 更新，避免全量重绘和重排
 - **版本锁定**：依赖精确版本号，无 `^` 前缀，避免 break change
 
 ## 文件结构
@@ -81,7 +84,7 @@ npm run dev
 
 ### GET /api/history
 
-查询历史数据。
+查询历史数据。每条记录包含写入时的告警标记（`alert`、`alert_direction`、`threshold_min`、`threshold_max`），均为写入时刻的真实状态，不是前端事后重算。
 
 **参数：**
 - `sensor` - 传感器类型（可选，如 temperature）
@@ -93,6 +96,23 @@ npm run dev
 ```
 GET /api/history?sensor=temperature&from=1719000000000&to=1719003600000
 ```
+
+### GET /api/alerts
+
+查询告警事件列表。
+
+**参数：**
+- `sensor` - 传感器类型（可选）
+- `status` - 告警状态：`active` / `resolved` / `device_offline` / `shutdown`
+- `from` - 起始时间戳（毫秒）
+- `to` - 结束时间戳（毫秒）
+- `limit` - 返回数量限制
+
+**事件状态说明：**
+- `active` — 告警进行中
+- `resolved` — 已恢复正常
+- `device_offline` — 因设备离线结束
+- `shutdown` — 因服务关闭结束
 
 ### GET /api/config
 

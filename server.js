@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3000;
 const MQTT_PORT = process.env.MQTT_PORT || 1883;
 const DB_PATH = path.join(__dirname, 'db.sqlite');
 const OFFLINE_TIMEOUT = 10000;
+const DEVICE_CHECK_INTERVAL = 2000;
 
 const app = express();
 const server = http.createServer(app);
@@ -19,47 +20,120 @@ const mqttServer = net.createServer(aedes.handle);
 
 const db = new DatabaseSync(DB_PATH);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sensor_data (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    device_id TEXT NOT NULL,
-    sensor_type TEXT NOT NULL,
-    value REAL NOT NULL,
-    unit TEXT,
-    alert INTEGER NOT NULL DEFAULT 0,
-    alert_direction TEXT,
-    threshold_min REAL,
-    threshold_max REAL,
-    timestamp INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_sensor_timestamp ON sensor_data(sensor_type, timestamp);
-  CREATE INDEX IF NOT EXISTS idx_timestamp ON sensor_data(timestamp);
-`);
+const migrations = [
+  {
+    version: 1,
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS sensor_data (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          device_id TEXT NOT NULL,
+          sensor_type TEXT NOT NULL,
+          value REAL NOT NULL,
+          unit TEXT,
+          timestamp INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sensor_timestamp ON sensor_data(sensor_type, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_timestamp ON sensor_data(timestamp);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    device_id TEXT NOT NULL,
-    sensor_type TEXT NOT NULL,
-    direction TEXT NOT NULL,
-    value REAL NOT NULL,
-    threshold_min REAL,
-    threshold_max REAL,
-    started_at INTEGER NOT NULL,
-    resolved_at INTEGER,
-    duration INTEGER,
-    status TEXT NOT NULL DEFAULT 'active'
-  );
-  CREATE INDEX IF NOT EXISTS idx_alerts_sensor ON alerts(sensor_type, started_at);
-  CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
-`);
+        CREATE TABLE IF NOT EXISTS config (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+      `);
+    }
+  },
+  {
+    version: 2,
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE sensor_data ADD COLUMN alert INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE sensor_data ADD COLUMN alert_direction TEXT;
+        ALTER TABLE sensor_data ADD COLUMN threshold_min REAL;
+        ALTER TABLE sensor_data ADD COLUMN threshold_max REAL;
+      `);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS alerts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          device_id TEXT NOT NULL,
+          sensor_type TEXT NOT NULL,
+          direction TEXT NOT NULL,
+          value REAL NOT NULL,
+          threshold_min REAL,
+          threshold_max REAL,
+          started_at INTEGER NOT NULL,
+          resolved_at INTEGER,
+          duration INTEGER,
+          status TEXT NOT NULL DEFAULT 'active'
+        );
+        CREATE INDEX IF NOT EXISTS idx_alerts_sensor ON alerts(sensor_type, started_at);
+        CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+      `);
+    }
+  },
+  {
+    version: 3,
+    up: (db) => {
+    }
+  }
+];
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS config (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-  )
-`);
+const LATEST_SCHEMA_VERSION = migrations[migrations.length - 1].version;
+
+function getSchemaVersion() {
+  try {
+    const stmt = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?");
+    const row = stmt.get('schema_version');
+    if (!row) {
+      const stmt2 = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?");
+      const hasSensorData = stmt2.get('sensor_data');
+      const hasAlerts = stmt2.get('alerts');
+      if (!hasSensorData) return 0;
+      if (hasAlerts) return 2;
+      return 1;
+    }
+    const stmt3 = db.prepare('SELECT MAX(version) as v FROM schema_version');
+    const r = stmt3.get();
+    return r ? r.v || 0 : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+function runMigrations() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_version (
+      version INTEGER PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    )
+  `);
+
+  const currentVersion = getSchemaVersion();
+  console.log(`[DB] 当前 schema 版本: v${currentVersion}, 最新版本: v${LATEST_SCHEMA_VERSION}`);
+
+  if (currentVersion >= LATEST_SCHEMA_VERSION) {
+    console.log('[DB] Schema 已是最新，无需迁移');
+    return;
+  }
+
+  for (const migration of migrations) {
+    if (migration.version > currentVersion) {
+      console.log(`[DB] 正在迁移到 v${migration.version}...`);
+      try {
+        migration.up(db);
+        const stmt = db.prepare('INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)');
+        stmt.run(migration.version, Date.now());
+        console.log(`[DB] 迁移到 v${migration.version} 完成 ✓`);
+      } catch (err) {
+        console.error(`[DB] 迁移到 v${migration.version} 失败:`, err.message);
+        throw err;
+      }
+    }
+  }
+  console.log('[DB] 全部迁移完成');
+}
+
+runMigrations();
 
 const defaultThresholds = {
   temperature: { min: 10, max: 35 },
@@ -70,8 +144,10 @@ const defaultThresholds = {
 };
 
 let thresholds = loadThresholds();
-
 const activeAlerts = {};
+const latestData = {};
+const lastSeen = {};
+let deviceOnline = false;
 
 function loadThresholds() {
   try {
@@ -90,24 +166,23 @@ function saveThresholds(th) {
   stmt.run('thresholds', JSON.stringify(th));
 }
 
-const insertSensorStmt = db.prepare(
-  'INSERT INTO sensor_data (device_id, sensor_type, value, unit, alert, alert_direction, threshold_min, threshold_max, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-);
+let insertSensorStmt;
+let insertAlertStmt;
+let resolveAlertStmt;
 
-const insertAlertStmt = db.prepare(
-  'INSERT INTO alerts (device_id, sensor_type, direction, value, threshold_min, threshold_max, started_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-);
+function prepareStatements() {
+  insertSensorStmt = db.prepare(
+    'INSERT INTO sensor_data (device_id, sensor_type, value, unit, alert, alert_direction, threshold_min, threshold_max, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  );
+  insertAlertStmt = db.prepare(
+    'INSERT INTO alerts (device_id, sensor_type, direction, value, threshold_min, threshold_max, started_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  );
+  resolveAlertStmt = db.prepare(
+    'UPDATE alerts SET status = ?, resolved_at = ?, duration = ? WHERE id = ?'
+  );
+}
 
-const resolveAlertStmt = db.prepare(
-  'UPDATE alerts SET status = ?, resolved_at = ?, duration = ? WHERE id = ?'
-);
-
-const findActiveAlertStmt = db.prepare(
-  'SELECT id, started_at FROM alerts WHERE sensor_type = ? AND status = ? ORDER BY started_at DESC LIMIT 1'
-);
-
-const latestData = {};
-const lastSeen = {};
+prepareStatements();
 
 function isDeviceOnline(deviceId) {
   const last = lastSeen[deviceId];
@@ -144,8 +219,33 @@ function processAlertTransition(deviceId, sensorType, value, alertInfo, timestam
     resolveAlertStmt.run('resolved', timestamp, duration, alert.id);
     delete activeAlerts[sensorType];
     console.log(`[告警] ${sensorType} 恢复正常，持续 ${Math.round(duration / 1000)} 秒`);
-  } else if (isAlert && wasAlert) {
-    // 持续告警中，可扩展为持续记录
+  }
+}
+
+function resolveAllActiveAlerts(reason) {
+  const sensorTypes = Object.keys(activeAlerts);
+  if (sensorTypes.length === 0) return 0;
+
+  const now = Date.now();
+  for (const sensorType of sensorTypes) {
+    const alert = activeAlerts[sensorType];
+    const duration = now - alert.startedAt;
+    resolveAlertStmt.run(reason, now, duration, alert.id);
+    delete activeAlerts[sensorType];
+  }
+  console.log(`[告警] 已结算 ${sensorTypes.length} 条活跃告警，原因: ${reason}`);
+  return sensorTypes.length;
+}
+
+function checkDeviceOffline() {
+  const deviceId = 'greenhouse-edge-001';
+  const wasOnline = deviceOnline;
+  const isOnline = isDeviceOnline(deviceId);
+  deviceOnline = isOnline;
+
+  if (wasOnline && !isOnline) {
+    console.log('[状态] 设备超时判定离线');
+    resolveAllActiveAlerts('timeout_offline');
   }
 }
 
@@ -158,16 +258,20 @@ mqttClient.on('connect', () => {
   mqttClient.subscribe('greenhouse/sensors', { qos: 0 });
   mqttClient.subscribe('greenhouse/status', { qos: 1 });
 
-  const activeStmt = db.prepare('SELECT id, sensor_type, direction, started_at FROM alerts WHERE status = ?');
-  const rows = activeStmt.all('active');
-  for (const row of rows) {
-    activeAlerts[row.sensor_type] = {
-      id: row.id,
-      direction: row.direction,
-      startedAt: row.started_at
-    };
+  try {
+    const activeStmt = db.prepare('SELECT id, sensor_type, direction, started_at FROM alerts WHERE status = ?');
+    const rows = activeStmt.all('active');
+    for (const row of rows) {
+      activeAlerts[row.sensor_type] = {
+        id: row.id,
+        direction: row.direction,
+        startedAt: row.started_at
+      };
+    }
+    console.log(`[告警] 从数据库恢复 ${rows.length} 条活跃告警`);
+  } catch (e) {
+    console.warn('[告警] 恢复活跃告警失败:', e.message);
   }
-  console.log(`[告警] 恢复 ${rows.length} 条活跃告警`);
 });
 
 mqttClient.on('message', (topic, message) => {
@@ -179,14 +283,11 @@ mqttClient.on('message', (topic, message) => {
       const deviceId = data.deviceId || 'greenhouse-edge-001';
       if (data.status === 'online') {
         lastSeen[deviceId] = Date.now();
+        deviceOnline = true;
       } else if (data.status === 'offline') {
         lastSeen[deviceId] = 0;
-        for (const sensorType of Object.keys(activeAlerts)) {
-          const alert = activeAlerts[sensorType];
-          const now = Date.now();
-          resolveAlertStmt.run('device_offline', now, now - alert.startedAt, alert.id);
-          delete activeAlerts[sensorType];
-        }
+        deviceOnline = false;
+        resolveAllActiveAlerts('device_offline');
       }
       return;
     }
@@ -195,6 +296,7 @@ mqttClient.on('message', (topic, message) => {
       const deviceId = data.deviceId || 'unknown';
       const timestamp = data.timestamp || Date.now();
       lastSeen[deviceId] = timestamp;
+      deviceOnline = true;
 
       for (const [sensorType, reading] of Object.entries(data.readings)) {
         const alertInfo = checkThreshold(sensorType, reading.value);
@@ -219,136 +321,213 @@ mqttClient.on('message', (topic, message) => {
       }
     }
   } catch (err) {
-    console.error('[MQTT] 消息解析错误:', err.message);
+    console.error('[MQTT] 消息处理错误:', err.message);
   }
 });
+
+setInterval(checkDeviceOffline, DEVICE_CHECK_INTERVAL);
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-app.get('/api/latest', (req, res) => {
-  const deviceId = 'greenhouse-edge-001';
-  const online = isDeviceOnline(deviceId);
-  res.json({
-    deviceId,
-    online,
-    lastSeen: lastSeen[deviceId] || null,
-    sensors: latestData,
-    activeAlerts: Object.keys(activeAlerts).length,
-    thresholds
+function sendError(res, statusCode, message, code) {
+  res.status(statusCode).json({
+    success: false,
+    error: {
+      code: code || 'INTERNAL_ERROR',
+      message: message || 'Internal Server Error'
+    }
   });
+}
+
+function sendSuccess(res, data, statusCode) {
+  res.status(statusCode || 200).json({
+    success: true,
+    data
+  });
+}
+
+app.get('/api/latest', (req, res) => {
+  try {
+    const deviceId = 'greenhouse-edge-001';
+    const online = isDeviceOnline(deviceId);
+    res.json({
+      success: true,
+      data: {
+        deviceId,
+        online,
+        lastSeen: lastSeen[deviceId] || null,
+        sensors: latestData,
+        activeAlerts: Object.keys(activeAlerts).length,
+        thresholds
+      }
+    });
+  } catch (err) {
+    console.error('[API /api/latest]', err.message);
+    sendError(res, 500, '获取最新数据失败', 'FETCH_FAILED');
+  }
 });
 
 app.get('/api/history', (req, res) => {
-  const { sensor, from, to, limit } = req.query;
-
-  let sql = 'SELECT sensor_type, value, unit, alert, alert_direction, threshold_min, threshold_max, timestamp FROM sensor_data WHERE 1=1';
-  const params = [];
-
-  if (sensor) {
-    sql += ' AND sensor_type = ?';
-    params.push(sensor);
-  }
-  if (from) {
-    sql += ' AND timestamp >= ?';
-    params.push(parseInt(from));
-  }
-  if (to) {
-    sql += ' AND timestamp <= ?';
-    params.push(parseInt(to));
-  }
-
-  sql += ' ORDER BY timestamp ASC';
-
-  if (limit) {
-    sql += ' LIMIT ?';
-    params.push(parseInt(limit));
-  }
-
   try {
+    const { sensor, from, to, limit } = req.query;
+
+    let sql = 'SELECT sensor_type, value, unit, alert, alert_direction, threshold_min, threshold_max, timestamp FROM sensor_data WHERE 1=1';
+    const params = [];
+
+    if (sensor) {
+      sql += ' AND sensor_type = ?';
+      params.push(sensor);
+    }
+    if (from) {
+      sql += ' AND timestamp >= ?';
+      params.push(parseInt(from));
+    }
+    if (to) {
+      sql += ' AND timestamp <= ?';
+      params.push(parseInt(to));
+    }
+
+    sql += ' ORDER BY timestamp ASC';
+
+    if (limit) {
+      sql += ' LIMIT ?';
+      params.push(parseInt(limit));
+    }
+
     const stmt = db.prepare(sql);
     const rows = stmt.all(...params).map(r => ({
       ...r,
       alert: r.alert === 1
     }));
-    res.json({ count: rows.length, data: rows });
+
+    res.json({
+      success: true,
+      data: {
+        count: rows.length,
+        items: rows
+      }
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[API /api/history]', err.message);
+    sendError(res, 500, '查询历史数据失败', 'QUERY_FAILED');
   }
 });
 
 app.get('/api/alerts', (req, res) => {
-  const { sensor, status, from, to, limit } = req.query;
-
-  let sql = 'SELECT * FROM alerts WHERE 1=1';
-  const params = [];
-
-  if (sensor) {
-    sql += ' AND sensor_type = ?';
-    params.push(sensor);
-  }
-  if (status) {
-    sql += ' AND status = ?';
-    params.push(status);
-  }
-  if (from) {
-    sql += ' AND started_at >= ?';
-    params.push(parseInt(from));
-  }
-  if (to) {
-    sql += ' AND started_at <= ?';
-    params.push(parseInt(to));
-  }
-
-  sql += ' ORDER BY started_at DESC';
-
-  if (limit) {
-    sql += ' LIMIT ?';
-    params.push(parseInt(limit));
-  }
-
   try {
+    const { sensor, status, from, to, limit } = req.query;
+
+    let sql = 'SELECT * FROM alerts WHERE 1=1';
+    const params = [];
+
+    if (sensor) {
+      sql += ' AND sensor_type = ?';
+      params.push(sensor);
+    }
+    if (status) {
+      sql += ' AND status = ?';
+      params.push(status);
+    }
+    if (from) {
+      sql += ' AND started_at >= ?';
+      params.push(parseInt(from));
+    }
+    if (to) {
+      sql += ' AND started_at <= ?';
+      params.push(parseInt(to));
+    }
+
+    sql += ' ORDER BY started_at DESC';
+
+    if (limit) {
+      sql += ' LIMIT ?';
+      params.push(parseInt(limit));
+    }
+
     const stmt = db.prepare(sql);
     const rows = stmt.all(...params);
-    res.json({ count: rows.length, data: rows });
+
+    res.json({
+      success: true,
+      data: {
+        count: rows.length,
+        items: rows
+      }
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[API /api/alerts]', err.message);
+    sendError(res, 500, '查询告警事件失败', 'QUERY_FAILED');
   }
 });
 
 app.get('/api/config', (req, res) => {
-  res.json({ thresholds });
+  try {
+    res.json({
+      success: true,
+      data: { thresholds }
+    });
+  } catch (err) {
+    console.error('[API /api/config GET]', err.message);
+    sendError(res, 500, '获取配置失败', 'FETCH_FAILED');
+  }
 });
 
 app.post('/api/config', (req, res) => {
-  const { thresholds: newThresholds } = req.body;
-  if (!newThresholds || typeof newThresholds !== 'object') {
-    return res.status(400).json({ error: '无效的配置格式' });
-  }
+  try {
+    const { thresholds: newThresholds } = req.body;
+    if (!newThresholds || typeof newThresholds !== 'object') {
+      return sendError(res, 400, '无效的配置格式', 'INVALID_FORMAT');
+    }
 
-  for (const sensor of Object.keys(thresholds)) {
-    if (newThresholds[sensor]) {
-      if (typeof newThresholds[sensor].min === 'number') {
-        thresholds[sensor].min = newThresholds[sensor].min;
-      }
-      if (typeof newThresholds[sensor].max === 'number') {
-        thresholds[sensor].max = newThresholds[sensor].max;
+    for (const sensor of Object.keys(thresholds)) {
+      if (newThresholds[sensor]) {
+        if (typeof newThresholds[sensor].min === 'number') {
+          thresholds[sensor].min = newThresholds[sensor].min;
+        }
+        if (typeof newThresholds[sensor].max === 'number') {
+          thresholds[sensor].max = newThresholds[sensor].max;
+        }
       }
     }
-  }
 
-  saveThresholds(thresholds);
-  res.json({ success: true, thresholds });
+    saveThresholds(thresholds);
+    res.json({
+      success: true,
+      data: { thresholds }
+    });
+  } catch (err) {
+    console.error('[API /api/config POST]', err.message);
+    sendError(res, 500, '保存配置失败', 'SAVE_FAILED');
+  }
 });
 
 app.get('/api/status', (req, res) => {
-  const deviceId = 'greenhouse-edge-001';
-  res.json({
-    deviceId,
-    online: isDeviceOnline(deviceId),
-    lastSeen: lastSeen[deviceId] || null,
-    offlineTimeout: OFFLINE_TIMEOUT
-  });
+  try {
+    const deviceId = 'greenhouse-edge-001';
+    res.json({
+      success: true,
+      data: {
+        deviceId,
+        online: isDeviceOnline(deviceId),
+        lastSeen: lastSeen[deviceId] || null,
+        offlineTimeout: OFFLINE_TIMEOUT,
+        schemaVersion: LATEST_SCHEMA_VERSION
+      }
+    });
+  } catch (err) {
+    console.error('[API /api/status]', err.message);
+    sendError(res, 500, '获取状态失败', 'FETCH_FAILED');
+  }
+});
+
+app.use((req, res) => {
+  sendError(res, 404, '接口不存在', 'NOT_FOUND');
+});
+
+app.use((err, req, res, next) => {
+  console.error('[API 未捕获错误]', err.message);
+  sendError(res, 500, '服务器内部错误', 'INTERNAL_ERROR');
 });
 
 mqttServer.listen(MQTT_PORT, () => {
@@ -359,15 +538,12 @@ server.listen(PORT, () => {
   console.log(`[HTTP] 服务器已启动，端口: ${PORT}`);
   console.log(`[HTTP] 前端页面: http://localhost:${PORT}`);
   console.log(`[HTTP] API: /api/latest, /api/history, /api/alerts, /api/config, /api/status`);
+  console.log(`[DB] Schema 版本: v${LATEST_SCHEMA_VERSION}`);
 });
 
 process.on('SIGINT', () => {
   console.log('\n[服务端] 正在优雅关闭...');
-  for (const sensorType of Object.keys(activeAlerts)) {
-    const alert = activeAlerts[sensorType];
-    const now = Date.now();
-    resolveAlertStmt.run('shutdown', now, now - alert.startedAt, alert.id);
-  }
+  resolveAllActiveAlerts('shutdown');
   mqttClient.end();
   aedes.close(() => {
     mqttServer.close();

@@ -192,10 +192,17 @@
   .btn:active { transform: translateY(0); }
 
   .alerts-list {
-    max-height: 240px;
+    max-height: 280px;
     overflow-y: auto;
     background: rgba(0, 0, 0, 0.2);
     border-radius: 8px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.2) transparent;
+  }
+  .alerts-list::-webkit-scrollbar { width: 6px; }
+  .alerts-list::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,0.2);
+    border-radius: 3px;
   }
   .alert-item {
     padding: 10px 15px;
@@ -204,6 +211,7 @@
     justify-content: space-between;
     align-items: center;
     font-size: 13px;
+    transition: background 0.3s;
   }
   .alert-item:last-child { border-bottom: none; }
   .alert-item.active {
@@ -213,8 +221,12 @@
   .alert-item.resolved {
     border-left: 3px solid #00ff88;
   }
-  .alert-item.offline {
+  .alert-item.device_offline,
+  .alert-item.timeout_offline {
     border-left: 3px solid #ffaa00;
+  }
+  .alert-item.shutdown {
+    border-left: 3px solid #999;
   }
   .alert-sensor {
     font-weight: 600;
@@ -257,9 +269,36 @@
   .sensor-light { color: #ffe66d; }
   .sensor-soil { color: #95e1d3; }
   .sensor-co2 { color: #f38181; }
+
+  .toast {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    padding: 12px 20px;
+    background: rgba(0,0,0,0.85);
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 8px;
+    color: #fff;
+    font-size: 14px;
+    z-index: 1000;
+    opacity: 0;
+    transform: translateX(100%);
+    transition: all 0.3s ease;
+    pointer-events: none;
+  }
+  .toast.show {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  .toast.error {
+    border-color: #ff4444;
+    color: #ff6666;
+  }
 </style>
 </head>
 <body>
+  <div id="toast" class="toast"></div>
+
   <div class="header">
     <h1>🌱 智能温室 IoT 边缘网关 - 实时监控</h1>
     <div class="status-bar">
@@ -408,6 +447,9 @@ sensors.forEach(sensor => {
   dataPoints[sensor] = { labels: [], values: [], alerts: [] };
 });
 
+const alertCache = new Map();
+let lastAlertCount = 0;
+
 const chartOptions = {
   responsive: true,
   maintainAspectRatio: false,
@@ -484,7 +526,7 @@ function formatDateTime(ts) {
 }
 
 function formatDuration(ms) {
-  if (!ms) return '-';
+  if (!ms && ms !== 0) return '进行中';
   const s = Math.floor(ms / 1000);
   if (s < 60) return s + '秒';
   const m = Math.floor(s / 60);
@@ -492,10 +534,36 @@ function formatDuration(ms) {
   return m + '分' + rs + '秒';
 }
 
+function showToast(message, type) {
+  const toast = document.getElementById('toast');
+  toast.textContent = message;
+  toast.className = 'toast show' + (type ? ' ' + type : '');
+  setTimeout(() => {
+    toast.className = 'toast' + (type ? ' ' + type : '');
+  }, 3000);
+}
+
+async function apiRequest(url, options) {
+  try {
+    const res = await fetch(url, options);
+    const data = await res.json();
+    if (!data.success) {
+      const msg = data.error?.message || '请求失败';
+      showToast(msg, 'error');
+      throw new Error(msg);
+    }
+    return data.data;
+  } catch (err) {
+    if (!err.message.includes('请求失败')) {
+      showToast('网络请求失败', 'error');
+    }
+    throw err;
+  }
+}
+
 async function fetchLatest() {
   try {
-    const res = await fetch('/api/latest');
-    const data = await res.json();
+    const data = await apiRequest('/api/latest');
 
     const statusEl = document.getElementById('deviceStatus');
     if (data.online) {
@@ -562,7 +630,7 @@ async function fetchLatest() {
 
     loadAlertEvents();
   } catch (err) {
-    console.error('获取数据失败:', err);
+    // 错误已在 apiRequest 中处理
   }
 }
 
@@ -589,26 +657,26 @@ async function loadHistory() {
   const from = now - 5 * 60 * 1000;
 
   try {
-    const res = await fetch(`/api/history?from=${from}&to=${now}`);
-    const data = await res.json();
+    const data = await apiRequest(`/api/history?from=${from}&to=${now}`);
+    const items = data.items;
 
     const grouped = {};
     sensors.forEach(s => grouped[s] = []);
 
-    data.data.forEach(item => {
+    items.forEach(item => {
       if (grouped[item.sensor_type]) {
         grouped[item.sensor_type].push(item);
       }
     });
 
     for (const sensor of sensors) {
-      const items = grouped[sensor] || [];
-      if (items.length === 0) continue;
+      const items2 = grouped[sensor] || [];
+      if (items2.length === 0) continue;
 
       const dp = dataPoints[sensor];
-      dp.labels = items.map(i => formatTime(i.timestamp));
-      dp.values = items.map(i => i.value);
-      dp.alerts = items.map(i => i.alert);
+      dp.labels = items2.map(i => formatTime(i.timestamp));
+      dp.values = items2.map(i => i.value);
+      dp.alerts = items2.map(i => i.alert);
 
       if (dp.labels.length > maxPoints) {
         const start = dp.labels.length - maxPoints;
@@ -620,54 +688,133 @@ async function loadHistory() {
       updateChart(sensor);
     }
   } catch (err) {
-    console.error('加载历史数据失败:', err);
+    // 错误已处理
+  }
+}
+
+function createAlertElement(alert) {
+  const sensorName = labelsMap[alert.sensor_type] || alert.sensor_type;
+  const directionText = alert.direction === 'high' ? '过高' : '过低';
+  const statusText = {
+    active: '进行中',
+    resolved: '已恢复',
+    device_offline: '设备离线',
+    timeout_offline: '超时离线',
+    shutdown: '服务关闭'
+  }[alert.status] || alert.status;
+
+  const el = document.createElement('div');
+  el.className = 'alert-item ' + alert.status;
+  el.dataset.id = alert.id;
+  el.innerHTML = `
+    <div>
+      <span class="alert-sensor">${sensorName}</span>
+      <span class="alert-direction ${alert.direction}">${directionText}</span>
+      <span class="alert-value">${alert.value} ${unitMap[alert.sensor_type] || ''}</span>
+    </div>
+    <div style="text-align: right;">
+      <div class="alert-time">${formatDateTime(alert.started_at)}</div>
+      <div class="alert-duration">${statusText} · ${formatDuration(alert.duration)}</div>
+    </div>
+  `;
+  return el;
+}
+
+function updateAlertElement(el, alert) {
+  const statusText = {
+    active: '进行中',
+    resolved: '已恢复',
+    device_offline: '设备离线',
+    timeout_offline: '超时离线',
+    shutdown: '服务关闭'
+  }[alert.status] || alert.status;
+
+  el.className = 'alert-item ' + alert.status;
+
+  const durEl = el.querySelector('.alert-duration');
+  if (durEl) {
+    durEl.textContent = statusText + ' · ' + formatDuration(alert.duration);
   }
 }
 
 async function loadAlertEvents() {
   try {
-    const res = await fetch('/api/alerts?limit=20');
-    const data = await res.json();
-
+    const data = await apiRequest('/api/alerts?limit=30');
+    const items = data.items;
     const listEl = document.getElementById('alertsList');
-    if (data.count === 0) {
-      listEl.innerHTML = '<div class="no-alerts">暂无告警记录</div>';
+
+    if (items.length === 0) {
+      if (alertCache.size > 0 || lastAlertCount !== 0) {
+        listEl.innerHTML = '<div class="no-alerts">暂无告警记录</div>';
+        alertCache.clear();
+        lastAlertCount = 0;
+      }
       return;
     }
 
-    let html = '';
-    for (const alert of data.data) {
-      const sensorName = labelsMap[alert.sensor_type] || alert.sensor_type;
-      const directionText = alert.direction === 'high' ? '过高' : '过低';
-      const statusClass = alert.status === 'active' ? 'active' :
-                          alert.status === 'resolved' ? 'resolved' : 'offline';
-      const statusText = alert.status === 'active' ? '进行中' :
-                         alert.status === 'resolved' ? '已恢复' : '设备离线';
-
-      html += `
-        <div class="alert-item ${statusClass}">
-          <div>
-            <span class="alert-sensor">${sensorName}</span>
-            <span class="alert-direction ${alert.direction}">${directionText}</span>
-            <span class="alert-value">${alert.value} ${unitMap[alert.sensor_type] || ''}</span>
-          </div>
-          <div style="text-align: right;">
-            <div class="alert-time">${formatDateTime(alert.started_at)}</div>
-            <div class="alert-duration">${statusText} · ${formatDuration(alert.duration)}</div>
-          </div>
-        </div>
-      `;
+    if (alertCache.size === 0) {
+      const frag = document.createDocumentFragment();
+      for (const alert of items) {
+        const el = createAlertElement(alert);
+        frag.appendChild(el);
+        alertCache.set(alert.id, { alert, el });
+      }
+      listEl.innerHTML = '';
+      listEl.appendChild(frag);
+      lastAlertCount = items.length;
+      return;
     }
-    listEl.innerHTML = html;
+
+    let changed = false;
+    const seenIds = new Set();
+
+    for (const alert of items) {
+      seenIds.add(alert.id);
+      const cached = alertCache.get(alert.id);
+
+      if (!cached) {
+        const el = createAlertElement(alert);
+        listEl.insertBefore(el, listEl.firstChild);
+        alertCache.set(alert.id, { alert, el });
+        changed = true;
+      } else {
+        const oldStatus = cached.alert.status;
+        const oldDuration = cached.alert.duration;
+        if (oldStatus !== alert.status || oldDuration !== alert.duration) {
+          updateAlertElement(cached.el, alert);
+          cached.alert = alert;
+          changed = true;
+        }
+      }
+    }
+
+    for (const [id, cached] of alertCache) {
+      if (!seenIds.has(id) && cached.alert.status === 'active') {
+        cached.el.remove();
+        alertCache.delete(id);
+        changed = true;
+      }
+    }
+
+    lastAlertCount = items.length;
+
+    if (changed) {
+      const sorted = Array.from(alertCache.entries())
+        .sort((a, b) => b[1].alert.started_at - a[1].alert.started_at);
+      for (const [id, cached] of sorted) {
+        if (cached.el.parentNode !== listEl) {
+          listEl.appendChild(cached.el);
+        }
+      }
+    }
   } catch (err) {
-    console.error('加载告警事件失败:', err);
+    // 错误已处理
   }
 }
 
 async function loadConfig() {
   try {
-    const res = await fetch('/api/config');
-    const data = await res.json();
+    const data = await apiRequest('/api/config');
     thresholds = data.thresholds;
 
     const inputMap = {
@@ -684,7 +831,7 @@ async function loadConfig() {
       document.getElementById(maxId).value = thresholds[sensor]?.max ?? '';
     }
   } catch (err) {
-    console.error('加载配置失败:', err);
+    // 错误已处理
   }
 }
 
@@ -711,19 +858,15 @@ async function saveConfig() {
   }
 
   try {
-    const res = await fetch('/api/config', {
+    const data = await apiRequest('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ thresholds: newThresholds })
     });
-    const data = await res.json();
-    if (data.success) {
-      thresholds = data.thresholds;
-      alert('配置已保存！');
-    }
+    thresholds = data.thresholds;
+    showToast('配置已保存');
   } catch (err) {
-    console.error('保存配置失败:', err);
-    alert('保存失败');
+    // 错误已处理
   }
 }
 
